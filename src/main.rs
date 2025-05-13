@@ -54,10 +54,6 @@ struct StarknetConnection {
 struct ToriiConnection {
     init_task: Option<JoinHandle<Result<WorldClient, torii_grpc_client::Error>>>,
     torii: Option<WorldClient>,
-}
-
-#[derive(Resource, Default)]
-struct ToriiSubscription {
     subscription_task: Option<JoinHandle<()>>,
     is_subscribed: bool,
 }
@@ -68,7 +64,6 @@ fn main() {
         .init_resource::<TokioRuntime>()
         .init_resource::<StarknetConnection>()
         .init_resource::<ToriiConnection>()
-        .init_resource::<ToriiSubscription>()
         .add_systems(
             Update,
             (
@@ -85,7 +80,6 @@ fn handle_keyboard_input(
     runtime: Res<TokioRuntime>,
     mut sn: ResMut<StarknetConnection>,
     mut torii: ResMut<ToriiConnection>,
-    mut subscription: ResMut<ToriiSubscription>,
     mut keyboard_input_events: EventReader<KeyboardInput>,
 ) {
     for event in keyboard_input_events.read() {
@@ -94,25 +88,22 @@ fn handle_keyboard_input(
                 WorldClient::new("http://localhost:8080".to_string(), WORLD_ADDRESS).await
             });
             torii.init_task = Some(task);
-        } else if event.key_code == KeyCode::KeyS && !subscription.is_subscribed {
+        } else if event.key_code == KeyCode::KeyS && !torii.is_subscribed {
             // Start subscription when 'S' is pressed
-            let world_address = WORLD_ADDRESS;
-            let task = runtime.runtime.spawn(async move {
-                let mut client = WorldClient::new("http://localhost:8080".to_string(), world_address)
-                    .await
-                    .expect("Failed to create Torii client");
-                
-                let mut subscription = client
-                    .subscribe_entities(None)
-                    .await
-                    .expect("Failed to subscribe");
+            if let Some(mut client) = torii.torii.take() {
+                let task = runtime.runtime.spawn(async move {
+                    let mut subscription = client
+                        .subscribe_entities(None)
+                        .await
+                        .expect("Failed to subscribe");
 
-                while let Some(Ok((n, e))) = subscription.next().await {
-                    info!("Torii update: {} {:?}", n, e);
-                }
-            });
-            subscription.subscription_task = Some(task);
-            subscription.is_subscribed = true;
+                    while let Some(Ok((n, e))) = subscription.next().await {
+                        info!("Torii update: {} {:?}", n, e);
+                    }
+                });
+                torii.subscription_task = Some(task);
+                torii.is_subscribed = true;
+            }
         } else if event.key_code == KeyCode::KeyC && sn.connecting_task.is_none() {
             info!("Starting connection...");
             let task = runtime
@@ -227,14 +218,17 @@ async fn connect_to_starknet() -> Arc<SingleOwnerAccount<AnyProvider, LocalWalle
 
 fn handle_torii_subscription(
     runtime: Res<TokioRuntime>,
-    mut subscription: ResMut<ToriiSubscription>,
+    mut torii: ResMut<ToriiConnection>,
 ) {
-    if let Some(task) = &mut subscription.subscription_task {
+    if let Some(task) = &mut torii.subscription_task {
         // Check if the subscription task is still running
         if runtime.runtime.block_on(async { task.is_finished() }) {
             info!("Torii subscription ended");
-            subscription.subscription_task = None;
-            subscription.is_subscribed = false;
+            torii.subscription_task = None;
+            torii.is_subscribed = false;
+            // Note: The client is consumed by the subscription task
+            // We'll need to reinitialize it if we want to use it again
+            torii.torii = None;
         }
     }
 }
