@@ -2,6 +2,7 @@ use bevy::ecs::world::CommandQueue;
 use bevy::input::ButtonState;
 use bevy::tasks::{AsyncComputeTaskPool, Task, futures_lite::future};
 use bevy::{input::keyboard::KeyboardInput, prelude::*};
+use futures::StreamExt;
 use starknet::accounts::single_owner::SignError;
 use starknet::accounts::{Account, AccountError, ExecutionEncoding, SingleOwnerAccount};
 use starknet::core::types::{Call, InvokeTransactionResult};
@@ -15,7 +16,9 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use torii_grpc_client::WorldClient;
-use torii_grpc_client::types::{KeysClause, Pagination, PaginationDirection, PatternMatching, Query as ToriiQuery};
+use torii_grpc_client::types::{
+    Clause, KeysClause, Pagination, PaginationDirection, PatternMatching, Query as ToriiQuery,
+};
 
 use url::Url;
 
@@ -53,15 +56,27 @@ struct ToriiConnection {
     torii: Option<WorldClient>,
 }
 
+#[derive(Resource, Default)]
+struct ToriiSubscription {
+    subscription_task: Option<JoinHandle<()>>,
+    is_subscribed: bool,
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .init_resource::<TokioRuntime>()
         .init_resource::<StarknetConnection>()
         .init_resource::<ToriiConnection>()
+        .init_resource::<ToriiSubscription>()
         .add_systems(
             Update,
-            (handle_keyboard_input, check_sn_task, check_torii_task),
+            (
+                handle_keyboard_input,
+                check_sn_task,
+                check_torii_task,
+                handle_torii_subscription,
+            ),
         )
         .run();
 }
@@ -69,8 +84,9 @@ fn main() {
 fn handle_keyboard_input(
     runtime: Res<TokioRuntime>,
     mut sn: ResMut<StarknetConnection>,
-    mut keyboard_input_events: EventReader<KeyboardInput>,
     mut torii: ResMut<ToriiConnection>,
+    mut subscription: ResMut<ToriiSubscription>,
+    mut keyboard_input_events: EventReader<KeyboardInput>,
 ) {
     for event in keyboard_input_events.read() {
         if event.key_code == KeyCode::KeyI && torii.init_task.is_none() {
@@ -78,6 +94,25 @@ fn handle_keyboard_input(
                 WorldClient::new("http://localhost:8080".to_string(), WORLD_ADDRESS).await
             });
             torii.init_task = Some(task);
+        } else if event.key_code == KeyCode::KeyS && !subscription.is_subscribed {
+            // Start subscription when 'S' is pressed
+            let world_address = WORLD_ADDRESS;
+            let task = runtime.runtime.spawn(async move {
+                let mut client = WorldClient::new("http://localhost:8080".to_string(), world_address)
+                    .await
+                    .expect("Failed to create Torii client");
+                
+                let mut subscription = client
+                    .subscribe_entities(None)
+                    .await
+                    .expect("Failed to subscribe");
+
+                while let Some(Ok((n, e))) = subscription.next().await {
+                    info!("Torii update: {} {:?}", n, e);
+                }
+            });
+            subscription.subscription_task = Some(task);
+            subscription.is_subscribed = true;
         } else if event.key_code == KeyCode::KeyC && sn.connecting_task.is_none() {
             info!("Starting connection...");
             let task = runtime
@@ -118,21 +153,22 @@ fn check_torii_task(runtime: Res<TokioRuntime>, mut torii: ResMut<ToriiConnectio
             torii.init_task = None;
 
             runtime.runtime.block_on(async move {
-                let response = torii.torii.as_mut().unwrap()
-                    .retrieve_entities(
-                        ToriiQuery {
-                            clause: None,
-                            pagination: Pagination {
-                                limit: 100,
-                                cursor: None,
-                                direction: PaginationDirection::Forward,
-                                order_by: vec![],
-                            },
-                            no_hashed_keys: false,
-                            models: vec![],
-                            historical: false,
+                let response = torii
+                    .torii
+                    .as_mut()
+                    .unwrap()
+                    .retrieve_entities(ToriiQuery {
+                        clause: None,
+                        pagination: Pagination {
+                            limit: 100,
+                            cursor: None,
+                            direction: PaginationDirection::Forward,
+                            order_by: vec![],
                         },
-                    )
+                        no_hashed_keys: false,
+                        models: vec![],
+                        historical: false,
+                    })
                     .await
                     .unwrap_or_default();
 
@@ -141,6 +177,7 @@ fn check_torii_task(runtime: Res<TokioRuntime>, mut torii: ResMut<ToriiConnectio
         }
     }
 }
+
 fn check_sn_task(runtime: Res<TokioRuntime>, mut sn: ResMut<StarknetConnection>) {
     // Check connection task
     if let Some(task) = &mut sn.connecting_task {
@@ -186,4 +223,18 @@ async fn connect_to_starknet() -> Arc<SingleOwnerAccount<AnyProvider, LocalWalle
         chain_id,
         ExecutionEncoding::New,
     ))
+}
+
+fn handle_torii_subscription(
+    runtime: Res<TokioRuntime>,
+    mut subscription: ResMut<ToriiSubscription>,
+) {
+    if let Some(task) = &mut subscription.subscription_task {
+        // Check if the subscription task is still running
+        if runtime.runtime.block_on(async { task.is_finished() }) {
+            info!("Torii subscription ended");
+            subscription.subscription_task = None;
+            subscription.is_subscribed = false;
+        }
+    }
 }
