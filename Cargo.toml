@@ -6,9 +6,11 @@ edition = "2024"
 [dependencies]
 bevy = "0.16.0"
 starknet = "0.13"
-account_sdk = { git = "https://github.com/cartridge-gg/controller", branch = "main" }
+#account_sdk = { git = "https://github.com/cartridge-gg/controller", branch = "main" }
 url = "2"
 tokio = { version = "1.0", features = ["full"] }
+#torii-client = { git = "https://github.com/dojoengine/torii", tag = "v1.5.3" }
+torii-grpc-client = { git = "https://github.com/dojoengine/torii", tag = "v1.5.3" }
 
 # Enable a small amount of optimization in the dev profile.
 [profile.dev]

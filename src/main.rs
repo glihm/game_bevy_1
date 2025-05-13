@@ -1,4 +1,5 @@
 use bevy::ecs::world::CommandQueue;
+use bevy::input::ButtonState;
 use bevy::tasks::{AsyncComputeTaskPool, Task, futures_lite::future};
 use bevy::{input::keyboard::KeyboardInput, prelude::*};
 use starknet::accounts::single_owner::SignError;
@@ -13,9 +14,14 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
+use torii_grpc::client::WorldClient;
+use torii_grpc::types::{EntityKeysClause, KeysClause, PatternMatching, Query as ToriiQuery};
 
 use account_sdk::{controller::Controller, signers::Owner};
 use url::Url;
+
+const WORLD_ADDRESS: Felt =
+    Felt::from_hex_unchecked("0x07cb912d0029e3799c4b8f2253b21481b2ec814c5daf72de75164ca82e7c42a5");
 
 // Resource to store the Tokio runtime.
 // This is a required resource since reqwest (used by starknet-rs) requires a runtime.
@@ -42,12 +48,22 @@ struct StarknetConnection {
     >,
 }
 
+#[derive(Resource, Default)]
+struct ToriiConnection {
+    init_task: Option<JoinHandle<Result<WorldClient, torii_client::error::Error>>>,
+    torii: Option<WorldClient>,
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .init_resource::<TokioRuntime>()
         .init_resource::<StarknetConnection>()
-        .add_systems(Update, (handle_keyboard_input, check_sn_task))
+        .init_resource::<ToriiConnection>()
+        .add_systems(
+            Update,
+            (handle_keyboard_input, check_sn_task, check_torii_task),
+        )
         .run();
 }
 
@@ -55,22 +71,29 @@ fn handle_keyboard_input(
     runtime: Res<TokioRuntime>,
     mut sn: ResMut<StarknetConnection>,
     mut keyboard_input_events: EventReader<KeyboardInput>,
+    mut torii: ResMut<ToriiConnection>,
 ) {
     for event in keyboard_input_events.read() {
-        if event.key_code == KeyCode::KeyC && sn.connecting_task.is_none() {
+        if event.key_code == KeyCode::KeyI && torii.init_task.is_none() {
+            let task = runtime.runtime.spawn(async move {
+                WorldClient::new("http://localhost:8080".to_string(), WORLD_ADDRESS).await
+            });
+            torii.init_task = Some(task);
+        } else if event.key_code == KeyCode::KeyC && sn.connecting_task.is_none() {
             info!("Starting connection...");
             let task = runtime
                 .runtime
                 .spawn(async move { connect_to_starknet().await });
             sn.connecting_task = Some(task);
-        } else if event.key_code == KeyCode::KeyT {
+        } else if event.key_code == KeyCode::KeyT && event.state == ButtonState::Pressed {
+            println!("event: {:?}", event);
             if let Some(account) = sn.account.clone() {
                 let calls = vec![Call {
                     to: Felt::from_hex_unchecked(
-                        "0x127fd5f1fe78a71f8bcd1fec63e3fe2f0486b6ecd5c86a0466c3a21fa5cfcec",
+                        "0x00a92391c5bcde7af4bad5fd0fff3834395b1ab8055a9abb8387c0e050a34edf",
                     ),
                     selector: Felt::from_hex_unchecked(
-                        "0x127fd5f1fe78a71f8bcd1fec63e3fe2f0486b6ecd5c86a0466c3a21fa5cfcec",
+                        "0x0217c73ea9ef26581623f20edd45571c1d024612b70d0af3e0842c5b0dc253cd",
                     ),
                     calldata: vec![],
                 }];
@@ -88,6 +111,36 @@ fn handle_keyboard_input(
     }
 }
 
+fn check_torii_task(runtime: Res<TokioRuntime>, mut torii: ResMut<ToriiConnection>) {
+    if let Some(task) = &mut torii.init_task {
+        if let Ok(Ok(client)) = runtime.runtime.block_on(async { task.await }) {
+            info!("Torii client initialized!");
+            torii.torii = Some(client);
+            torii.init_task = None;
+
+            let historical = false;
+
+            runtime.runtime.block_on(async {
+                let response = client
+                    .retrieve_entities(
+                        ToriiQuery {
+                            clause: None,
+                            limit: 10,
+                            offset: 0,
+                            dont_include_hashed_keys: false,
+                            order_by: vec![],
+                            entity_models: vec![],
+                            entity_updated_after: 10,
+                        },
+                        historical,
+                    )
+                    .await?;
+
+                println!("entities: {:?}", response);
+            });
+        }
+    }
+}
 fn check_sn_task(runtime: Res<TokioRuntime>, mut sn: ResMut<StarknetConnection>) {
     // Check connection task
     if let Some(task) = &mut sn.connecting_task {
