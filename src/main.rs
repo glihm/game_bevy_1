@@ -14,10 +14,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
-use torii_grpc::client::WorldClient;
-use torii_grpc::types::{EntityKeysClause, KeysClause, PatternMatching, Query as ToriiQuery};
+use torii_grpc_client::WorldClient;
+use torii_grpc_client::types::{KeysClause, Pagination, PaginationDirection, PatternMatching, Query as ToriiQuery};
 
-use account_sdk::{controller::Controller, signers::Owner};
 use url::Url;
 
 const WORLD_ADDRESS: Felt =
@@ -50,7 +49,7 @@ struct StarknetConnection {
 
 #[derive(Resource, Default)]
 struct ToriiConnection {
-    init_task: Option<JoinHandle<Result<WorldClient, torii_client::error::Error>>>,
+    init_task: Option<JoinHandle<Result<WorldClient, torii_grpc_client::Error>>>,
     torii: Option<WorldClient>,
 }
 
@@ -118,23 +117,24 @@ fn check_torii_task(runtime: Res<TokioRuntime>, mut torii: ResMut<ToriiConnectio
             torii.torii = Some(client);
             torii.init_task = None;
 
-            let historical = false;
-
-            runtime.runtime.block_on(async {
-                let response = client
+            runtime.runtime.block_on(async move {
+                let response = torii.torii.as_mut().unwrap()
                     .retrieve_entities(
                         ToriiQuery {
                             clause: None,
-                            limit: 10,
-                            offset: 0,
-                            dont_include_hashed_keys: false,
-                            order_by: vec![],
-                            entity_models: vec![],
-                            entity_updated_after: 10,
+                            pagination: Pagination {
+                                limit: 100,
+                                cursor: None,
+                                direction: PaginationDirection::Forward,
+                                order_by: vec![],
+                            },
+                            no_hashed_keys: false,
+                            models: vec![],
+                            historical: false,
                         },
-                        historical,
                     )
-                    .await?;
+                    .await
+                    .unwrap_or_default();
 
                 println!("entities: {:?}", response);
             });
