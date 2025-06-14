@@ -5,35 +5,27 @@
 //!
 //! This resources aims at providing a single point of access to interact with Dojo.
 
-use bevy::ecs::world::CommandQueue;
-use bevy::input::ButtonState;
 use bevy::platform::collections::HashMap;
-use bevy::tasks::{AsyncComputeTaskPool, Task, futures_lite::future};
-use bevy::{input::keyboard::KeyboardInput, prelude::*};
-use dojo_types::primitive::Primitive;
-use dojo_types::schema::{Enum, EnumOption, Member, Struct, Ty};
+use bevy::prelude::*;
+use dojo_types::schema::Struct;
 use futures::StreamExt;
 use starknet::accounts::single_owner::SignError;
 use starknet::accounts::{Account, AccountError, ExecutionEncoding, SingleOwnerAccount};
 use starknet::core::types::{Call, InvokeTransactionResult};
-use starknet::macros::selector;
 use starknet::providers::jsonrpc::HttpTransport;
-use starknet::providers::{JsonRpcClient, Provider, ProviderError};
+use starknet::providers::{JsonRpcClient, Provider};
 use starknet::signers::local_wallet::SignError as LocalWalletSignError;
 use starknet::signers::{LocalWallet, SigningKey};
 use starknet::{core::types::Felt, providers::AnyProvider};
 use std::collections::VecDeque;
-use std::os::unix::process;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::task::JoinHandle;
 use torii_grpc_client::WorldClient;
-use torii_grpc_client::types::proto::world::{RetrieveEntitiesResponse, SubscribeEntityResponse};
-use torii_grpc_client::types::{
-    Clause, KeysClause, Pagination, PaginationDirection, PatternMatching, Query as ToriiQuery,
-};
+use torii_grpc_client::types::proto::world::RetrieveEntitiesResponse;
+use torii_grpc_client::types::{Clause, Query as ToriiQuery};
 use url::Url;
 
 /// The Dojo plugin to connect Bevy to Torii and Starknet.
@@ -167,6 +159,12 @@ impl DojoResource {
         }
     }
 
+    /// Subscribes to entities updates from Torii.
+    ///
+    /// The subscription updates will be tracked by the background task spawned
+    /// in this function, and the channel will be used to send the updates to the
+    /// main thread where the bevy event is triggered to notify other systems
+    /// reading the `DojoEntityUpdated` event.
     pub fn subscribe_entities(&mut self, tokio: &TokioRuntime, id: String, clause: Option<Clause>) {
         if let Some(client) = self.torii.client.clone() {
             let sender = self.torii.subscription_sender.clone();
@@ -174,7 +172,7 @@ impl DojoResource {
                 let mut subscription = client
                     .lock()
                     .await
-                    .subscribe_entities(None)
+                    .subscribe_entities(clause)
                     .await
                     .expect("Failed to subscribe");
 
