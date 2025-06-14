@@ -27,257 +27,112 @@ use torii_grpc_client::types::{
 
 use url::Url;
 
-mod dojo;
+mod dojo_plugin;
 mod position;
 mod setup;
 
-use crate::dojo::{Dojo, StarknetConnection, TokioRuntime, ToriiConnection};
-use crate::position::{Position, PositionUpdateChannel, PositionUpdatedEvent};
+use crate::dojo_plugin::{
+    DojoEntityUpdated, DojoInitializedEvent, DojoPlugin, DojoResource, TokioRuntime,
+};
+use crate::position::Position;
 use crate::setup::Cube;
 
+const TORII_URL: &str = "http://localhost:8080";
+
+// Manifest related constants.
+// This is hard coded for now, but we should implement a logic to load
+// those data from the Dojo manifest.
 const WORLD_ADDRESS: Felt =
     Felt::from_hex_unchecked("0x04d9778a74d2c9e6e7e4a24cbe913998a80de217c66ee173a604d06dea5469c3");
-
 const ACTION_ADDRESS: Felt =
     Felt::from_hex_unchecked("0x00b056c9813fdc442118bdfead6fda526e5daa5fd7d543304117ed80154ea752");
-
 const SPAWN_SELECTOR: Felt = selector!("spawn");
 const MOVE_SELECTOR: Felt = selector!("move");
 
-fn main() {
-    let (sender, receiver) = channel(1);
+/// This event will be triggered every time the position is updated.
+#[derive(Event)]
+struct PositionUpdatedEvent(pub Position);
 
+/// Main entry point.
+fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
-        .init_resource::<Dojo>()
+        .add_plugins(DojoPlugin)
+        .init_resource::<DojoResource>()
         .init_resource::<TokioRuntime>()
-        .insert_resource(PositionUpdateChannel { sender, receiver })
         .add_event::<PositionUpdatedEvent>()
         .add_systems(Startup, setup::setup)
         .add_systems(
             Update,
             (
                 handle_keyboard_input,
-                check_sn_task,
-                check_torii_task,
-                handle_torii_subscription,
-                process_position_updates,
-                // Ensure the cube position is updated after the position updates are processed.
-                // This avoids the 1-frame overhead if the event is missed in the `update_cube_position` system.
-                update_cube_position.after(process_position_updates),
+                update_cube_position,
+                on_dojo_events,
             ),
         )
         .run();
 }
 
+/// This system is responsible for handling the keyboard input.
 fn handle_keyboard_input(
     tokio: Res<TokioRuntime>,
-    mut dojo: ResMut<Dojo>,
+    mut dojo: ResMut<DojoResource>,
     mut keyboard_input_events: EventReader<KeyboardInput>,
-    position_channel: Res<PositionUpdateChannel>,
 ) {
     for event in keyboard_input_events.read() {
         let key_code = event.key_code;
+        let is_pressed = event.state == ButtonState::Pressed;
 
-        if key_code == KeyCode::KeyI && dojo.torii.init_task.is_none() {
-            let task = tokio.runtime.spawn(async move {
-                WorldClient::new("http://localhost:8080".to_string(), WORLD_ADDRESS).await
-            });
-            dojo.torii.init_task = Some(task);
-        } else if key_code == KeyCode::KeyS && !dojo.torii.is_subscribed {
-            dbg!("SETUP SUBSCRIPTION...");
-            if let Some(mut client) = dojo.torii.client.take() {
-                let sender = position_channel.sender.clone();
-                let task = tokio.runtime.spawn(async move {
-                    let mut subscription = client
-                        .subscribe_entities(None)
-                        .await
-                        .expect("Failed to subscribe");
+        match key_code {
+            KeyCode::KeyC if is_pressed => {
+                // Dojo connect uses the dojo system to check for async tasks
+                // that initializes connections to Torii and Starknet account.
+                dojo.connect(&tokio, TORII_URL.to_string(), WORLD_ADDRESS);
 
-                    dbg!("SUBSCRIPTION CREATED...");
-
-                    while let Some(Ok((n, e))) = subscription.next().await {
-                        info!("Torii update: {} {:?}", n, e);
-
-                        for m in e.models {
-                            info!("model: {:?}", m);
-
-                            match m.name {
-                                ref name if name == "di-Position" => {
-                                    let position: Position = m.into();
-                                    println!("sending position: {:?}", position);
-                                    let _ = sender.send(position).await;
-                                }
-                                name if name == "di-Moves".to_string() => {}
-                                _ => panic!("skip"),
-                            };
-                        }
-                    }
-                });
-                dojo.torii.subscription_task = Some(task);
-                dojo.torii.is_subscribed = true;
+                // Hence, when here, we are not yet connected, until the next
+                // frame.
+                // TODO: this could be improved or by using a `is_ready()` function.
             }
-        } else if key_code == KeyCode::KeyC && dojo.sn.connecting_task.is_none() {
-            info!("Starting connection...");
-            let task = tokio.runtime.spawn(async move { connect_to_starknet().await });
-            dojo.sn.connecting_task = Some(task);
-        } else if key_code == KeyCode::KeyT && event.state == ButtonState::Pressed {
-            if let Some(account) = dojo.sn.account.clone() {
+            KeyCode::Space if is_pressed => {
+                info!("Spawning.");
                 let calls = vec![Call {
                     to: ACTION_ADDRESS,
                     selector: SPAWN_SELECTOR,
                     calldata: vec![],
                 }];
 
-                // Move both account and calls into the async block
-                let task = tokio.runtime.spawn(async move {
-                    // Create the transaction inside the async block where we own the account
-                    let tx = account.execute_v3(calls);
-                    tx.send().await
-                });
-
-                dojo.sn.pending_txs.push_back(task);
+                dojo.queue_tx(&tokio, calls);
             }
-        }
+            KeyCode::KeyS if is_pressed => {
+                info!("Setting up Torii subscription.");
+                dojo.subscribe_entities(&tokio, "position".to_string(), None);
+            }
+            KeyCode::ArrowLeft | KeyCode::ArrowRight | KeyCode::ArrowUp | KeyCode::ArrowDown
+                if is_pressed =>
+            {
+                let direction = match key_code {
+                    KeyCode::ArrowLeft => 0,
+                    KeyCode::ArrowRight => 1,
+                    KeyCode::ArrowUp => 2,
+                    KeyCode::ArrowDown => 3,
+                    _ => panic!("Invalid key code"),
+                };
 
-        // Handles the arrows to send a transaction to move the cube.
-        if vec![
-            KeyCode::ArrowLeft,
-            KeyCode::ArrowRight,
-            KeyCode::ArrowUp,
-            KeyCode::ArrowDown,
-        ]
-        .contains(&key_code)
-            && event.state == ButtonState::Pressed
-        {
-            let direction = match key_code {
-                KeyCode::ArrowLeft => 0,
-                KeyCode::ArrowRight => 1,
-                KeyCode::ArrowUp => 2,
-                KeyCode::ArrowDown => 3,
-                _ => panic!("Invalid key code"),
-            };
-
-            if let Some(account) = dojo.sn.account.clone() {
                 let calls = vec![Call {
                     to: ACTION_ADDRESS,
                     selector: MOVE_SELECTOR,
                     calldata: vec![Felt::from(direction)],
                 }];
 
-                // Move both account and calls into the async block
-                let task = tokio.runtime.spawn(async move {
-                    // Create the transaction inside the async block where we own the account
-                    let tx = account.execute_v3(calls);
-                    tx.send().await
-                });
-
-                dojo.sn.pending_txs.push_back(task);
+                dojo.queue_tx(&tokio, calls);
             }
+            _ => continue,
         }
     }
 }
 
-fn check_torii_task(tokio: Res<TokioRuntime>, mut dojo: ResMut<Dojo>) {
-    if let Some(task) = &mut dojo.torii.init_task {
-        if let Ok(Ok(client)) = tokio.runtime.block_on(async { task.await }) {
-            info!("Torii client initialized!");
-            dojo.torii.client = Some(client);
-            dojo.torii.init_task = None;
-
-            tokio.runtime.block_on(async move {
-                let response = dojo
-                    .torii
-                    .client
-                    .as_mut()
-                    .unwrap()
-                    .retrieve_entities(ToriiQuery {
-                        clause: None,
-                        pagination: Pagination {
-                            limit: 100,
-                            cursor: None,
-                            direction: PaginationDirection::Forward,
-                            order_by: vec![],
-                        },
-                        no_hashed_keys: false,
-                        models: vec![],
-                        historical: false,
-                    })
-                    .await
-                    .unwrap_or_default();
-
-                println!("entities: {:?}", response);
-            });
-        }
-    }
-}
-
-fn check_sn_task(tokio: Res<TokioRuntime>, mut dojo: ResMut<Dojo>) {
-    // Check connection task
-    if let Some(task) = &mut dojo.sn.connecting_task {
-        if let Ok(account) = tokio.runtime.block_on(async { task.await }) {
-            info!("Connected to Starknet!");
-            dojo.sn.account = Some(account);
-            dojo.sn.connecting_task = None;
-        }
-    }
-
-    // Check pending transactions
-    if !dojo.sn.pending_txs.is_empty() && dojo.sn.account.is_some() {
-        if let Some(task) = dojo.sn.pending_txs.pop_front() {
-            if let Ok(Ok(result)) = tokio.runtime.block_on(async { task.await }) {
-                info!("Transaction completed: {:#x}", result.transaction_hash);
-            }
-        }
-    }
-}
-
-async fn connect_to_starknet() -> Arc<SingleOwnerAccount<AnyProvider, LocalWallet>> {
-    let account_addr = Felt::from_hex_unchecked(
-        "0x127fd5f1fe78a71f8bcd1fec63e3fe2f0486b6ecd5c86a0466c3a21fa5cfcec",
-    );
-    let private_key = Felt::from_hex_unchecked(
-        "0xc5b2fcab997346f3ea1c00b002ecf6f382c5f9c9659a3894eb783c5320f912",
-    );
-
-    let rpc_url = Url::parse("http://0.0.0.0:5050").expect("Expecting Starknet RPC URL");
-    let provider =
-        AnyProvider::JsonRpcHttp(JsonRpcClient::new(HttpTransport::new(rpc_url.clone())));
-
-    let chain_id = provider.chain_id().await.unwrap();
-    //let chain_id = Felt::from(123);
-
-    let signer = LocalWallet::from(SigningKey::from_secret_scalar(private_key));
-    let address = account_addr;
-
-    Arc::new(SingleOwnerAccount::new(
-        provider,
-        signer,
-        address,
-        chain_id,
-        ExecutionEncoding::New,
-    ))
-}
-
-fn handle_torii_subscription(tokio: Res<TokioRuntime>, mut dojo: ResMut<Dojo>) {
-    if let Some(task) = &mut dojo.torii.subscription_task {
-        // Check if the subscription task is still running
-        if tokio.runtime.block_on(async { task.is_finished() }) {
-            info!("Torii subscription ended");
-            dojo.torii.subscription_task = None;
-            dojo.torii.is_subscribed = false;
-            // Note: The client is consumed by the subscription task
-            // We'll need to reinitialize it if we want to use it again
-            dojo.torii.client = None;
-        }
-    }
-}
-
-/// Updates the cube position by reacting to event notifying
-/// a position change from Torii.
-///
-/// We would want to use systems ordering to ensure this system is run after the keyboard move system,
-/// this will make sure we avoid the 1-frame overhead if the event is missed.
+/// Updates the cube position by reacting to the dedicated event
+/// for new position updates.
 fn update_cube_position(
     mut ev_position_updated: EventReader<PositionUpdatedEvent>,
     mut query: Query<&mut Transform, With<Cube>>,
@@ -290,16 +145,61 @@ fn update_cube_position(
     }
 }
 
-/// Processes the position updates from the channel.
+/// Reacts on Dojo events, which are emitted by the Dojo plugin.
 ///
-/// Technically, other systems could just use the channel resource directly.
-/// However, for decoupling and better observability, we use an event writer,
-/// which keeps Bevy's principles in mind.
-fn process_position_updates(
-    mut position_channel: ResMut<PositionUpdateChannel>,
+/// Any `queue_retrieve_entities` or `subscribe_entities` call will trigger
+/// the `DojoEntityUpdated` event.
+fn on_dojo_events(
+    mut dojo: ResMut<DojoResource>,
+    tokio: Res<TokioRuntime>,
+    mut ev_initialized: EventReader<DojoInitializedEvent>,
+    mut ev_retrieve_entities: EventReader<DojoEntityUpdated>,
     mut ev_position_updated: EventWriter<PositionUpdatedEvent>,
 ) {
-    while let Ok(position) = position_channel.receiver.try_recv() {
-        ev_position_updated.write(PositionUpdatedEvent(position));
+    for ev in ev_initialized.read() {
+        info!("Dojo initialized.");
+
+        // Initial fetch, which will make the Dojo plugin to send
+        // the query Torii, and trigger the `DojoEntityUpdated` event.
+        dojo.queue_retrieve_entities(
+            &tokio,
+            ToriiQuery {
+                clause: None,
+                pagination: Pagination {
+                    limit: 100,
+                    cursor: None,
+                    direction: PaginationDirection::Forward,
+                    order_by: vec![],
+                },
+                no_hashed_keys: false,
+                models: vec![],
+                historical: false,
+            },
+        );
+    }
+
+    // Since the deserialization of the models is project specific,
+    // currently the way it is done is by emitting an event for each
+    // models updates we are interested in.
+    // This may become too much for a large number of models though.
+    // Maybe the solution would be to generate a plugin via bindgen,
+    // that registers all of this automatically.
+    for ev in ev_retrieve_entities.read() {
+        info!("Torii update: {:?}", ev.entity_id);
+
+        for m in &ev.models {
+            debug!("model: {:?}", &m);
+
+            match m.name.as_str() {
+                "di-Position" => {
+                    ev_position_updated.write(PositionUpdatedEvent(m.into()));
+                }
+                name if name == "di-Moves".to_string() => {}
+                _ => {
+                    // Not handled.
+                    warn!("Model not handled: {:?}", m);
+                }
+            };
+        }
     }
 }
