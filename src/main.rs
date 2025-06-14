@@ -1,3 +1,14 @@
+//! Example of Dojo plugin usage.
+//!
+//! TODO:
+//! 1. Add text to explain bindings.
+//! 2. Use multiple accounts using `1`, `2`, etc... keys,
+//! 3. Add the player address on the top of the cube.
+//! 4. Choose a random color for every new spawned cube.
+//! 5. Add the delete entity concept, when pressing backspace on a cube.
+//!
+//! Switching between accounts will show the different cubes moving.
+
 use bevy::input::ButtonState;
 use bevy::{input::keyboard::KeyboardInput, prelude::*};
 use starknet::core::types::Call;
