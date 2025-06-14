@@ -3409,6 +3409,7 @@ version = "0.1.0"
 dependencies = [
  "account_sdk",
  "bevy",
+ "dojo-types",
  "futures",
  "starknet 0.13.0",
  "tokio",
@@ -7611,8 +7612,8 @@ dependencies = [
 
 [[package]]
 name = "torii-grpc-client"
-version = "1.5.3"
-source = "git+https://github.com/dojoengine/torii?branch=main#c63541b64cb47affd57eb54cc846c0cf10d9480c"
+version = "1.5.8-preview.1"
+source = "git+https://github.com/dojoengine/torii?rev=ee8756a#ee8756a5b773e77659031c654c4ccc1e9d9005da"
 dependencies = [
  "crypto-bigint",
  "dojo-types",
@@ -7637,8 +7638,8 @@ dependencies = [
 
 [[package]]
 name = "torii-proto"
-version = "1.5.3"
-source = "git+https://github.com/dojoengine/torii?branch=main#c63541b64cb47affd57eb54cc846c0cf10d9480c"
+version = "1.5.8-preview.1"
+source = "git+https://github.com/dojoengine/torii?rev=ee8756a#ee8756a5b773e77659031c654c4ccc1e9d9005da"
 dependencies = [
  "crypto-bigint",
  "dojo-types",

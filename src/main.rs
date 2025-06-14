@@ -2,18 +2,23 @@ use bevy::ecs::world::CommandQueue;
 use bevy::input::ButtonState;
 use bevy::tasks::{AsyncComputeTaskPool, Task, futures_lite::future};
 use bevy::{input::keyboard::KeyboardInput, prelude::*};
+use dojo_types::primitive::Primitive;
+use dojo_types::schema::{Enum, EnumOption, Member, Struct, Ty};
 use futures::StreamExt;
 use starknet::accounts::single_owner::SignError;
 use starknet::accounts::{Account, AccountError, ExecutionEncoding, SingleOwnerAccount};
 use starknet::core::types::{Call, InvokeTransactionResult};
+use starknet::macros::selector;
 use starknet::providers::jsonrpc::HttpTransport;
 use starknet::providers::{JsonRpcClient, Provider, ProviderError};
 use starknet::signers::local_wallet::SignError as LocalWalletSignError;
 use starknet::signers::{LocalWallet, SigningKey};
 use starknet::{core::types::Felt, providers::AnyProvider};
 use std::collections::VecDeque;
+use std::os::unix::process;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::task::JoinHandle;
 use torii_grpc_client::WorldClient;
 use torii_grpc_client::types::{
@@ -23,7 +28,51 @@ use torii_grpc_client::types::{
 use url::Url;
 
 const WORLD_ADDRESS: Felt =
-    Felt::from_hex_unchecked("0x07cb912d0029e3799c4b8f2253b21481b2ec814c5daf72de75164ca82e7c42a5");
+    Felt::from_hex_unchecked("0x04d9778a74d2c9e6e7e4a24cbe913998a80de217c66ee173a604d06dea5469c3");
+
+const ACTION_ADDRESS: Felt =
+    Felt::from_hex_unchecked("0x00b056c9813fdc442118bdfead6fda526e5daa5fd7d543304117ed80154ea752");
+
+const SPAWN_SELECTOR: Felt = selector!("spawn");
+const MOVE_SELECTOR: Felt = selector!("move");
+
+#[derive(Component, Debug)]
+pub struct Position {
+    pub player: Felt,
+    pub x: u32,
+    pub y: u32,
+}
+
+impl From<Struct> for Position {
+    fn from(struct_value: Struct) -> Self {
+        let player = struct_value
+            .get("player")
+            .unwrap()
+            .as_primitive()
+            .unwrap()
+            .as_contract_address()
+            .unwrap();
+        let x = struct_value
+            .get("x")
+            .unwrap()
+            .as_primitive()
+            .unwrap()
+            .as_u32()
+            .unwrap();
+        let y = struct_value
+            .get("y")
+            .unwrap()
+            .as_primitive()
+            .unwrap()
+            .as_u32()
+            .unwrap();
+
+        Position { player, x, y }
+    }
+}
+
+#[derive(Event)]
+struct PositionUpdatedEvent(Position);
 
 // Resource to store the Tokio runtime.
 // This is a required resource since reqwest (used by starknet-rs) requires a runtime.
@@ -58,12 +107,23 @@ struct ToriiConnection {
     is_subscribed: bool,
 }
 
+#[derive(Resource)]
+struct PositionUpdateChannel {
+    pub sender: Sender<Position>,
+    pub receiver: Receiver<Position>,
+}
+
 fn main() {
+    let (sender, receiver) = channel(1);
+
     App::new()
         .add_plugins(DefaultPlugins)
         .init_resource::<TokioRuntime>()
         .init_resource::<StarknetConnection>()
         .init_resource::<ToriiConnection>()
+        .insert_resource(PositionUpdateChannel { sender, receiver })
+        .add_event::<PositionUpdatedEvent>()
+        .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
@@ -71,7 +131,12 @@ fn main() {
                 check_sn_task,
                 check_torii_task,
                 handle_torii_subscription,
-            ),
+                process_position_updates,
+
+                // Ensure the cube position is updated after the position updates are processed.
+                // This avoids the 1-frame overhead if the event is missed in the `update_cube_position` system.
+                update_cube_position.after(process_position_updates),
+            )
         )
         .run();
 }
@@ -81,46 +146,99 @@ fn handle_keyboard_input(
     mut sn: ResMut<StarknetConnection>,
     mut torii: ResMut<ToriiConnection>,
     mut keyboard_input_events: EventReader<KeyboardInput>,
+    position_channel: Res<PositionUpdateChannel>,
 ) {
     for event in keyboard_input_events.read() {
-        if event.key_code == KeyCode::KeyI && torii.init_task.is_none() {
+        let key_code = event.key_code;
+
+        if key_code == KeyCode::KeyI && torii.init_task.is_none() {
             let task = runtime.runtime.spawn(async move {
                 WorldClient::new("http://localhost:8080".to_string(), WORLD_ADDRESS).await
             });
             torii.init_task = Some(task);
-        } else if event.key_code == KeyCode::KeyS && !torii.is_subscribed {
-            // Start subscription when 'S' is pressed
+        } else if key_code == KeyCode::KeyS && !torii.is_subscribed {
+            dbg!("SETUP SUBSCRIPTION...");
             if let Some(mut client) = torii.torii.take() {
+                let sender = position_channel.sender.clone();
                 let task = runtime.runtime.spawn(async move {
                     let mut subscription = client
                         .subscribe_entities(None)
                         .await
                         .expect("Failed to subscribe");
 
+                    dbg!("SUBSCRIPTION CREATED...");
+
                     while let Some(Ok((n, e))) = subscription.next().await {
                         info!("Torii update: {} {:?}", n, e);
+
+                        for m in e.models {
+                            info!("model: {:?}", m);
+
+                            match m.name {
+                                ref name if name == "di-Position" => {
+                                    let position: Position = m.into();
+                                    println!("sending position: {:?}", position);
+                                    let _ = sender.send(position).await;
+                                }
+                                name if name == "di-Moves".to_string() => {}
+                                _ => panic!("skip"),
+                            };
+                        }
                     }
                 });
                 torii.subscription_task = Some(task);
                 torii.is_subscribed = true;
+                dbg!("IS SUBSCRIBED: {}", torii.is_subscribed);
             }
-        } else if event.key_code == KeyCode::KeyC && sn.connecting_task.is_none() {
+        } else if key_code == KeyCode::KeyC && sn.connecting_task.is_none() {
             info!("Starting connection...");
             let task = runtime
                 .runtime
                 .spawn(async move { connect_to_starknet().await });
             sn.connecting_task = Some(task);
-        } else if event.key_code == KeyCode::KeyT && event.state == ButtonState::Pressed {
+        } else if key_code == KeyCode::KeyT && event.state == ButtonState::Pressed {
             println!("event: {:?}", event);
             if let Some(account) = sn.account.clone() {
                 let calls = vec![Call {
-                    to: Felt::from_hex_unchecked(
-                        "0x00a92391c5bcde7af4bad5fd0fff3834395b1ab8055a9abb8387c0e050a34edf",
-                    ),
-                    selector: Felt::from_hex_unchecked(
-                        "0x0217c73ea9ef26581623f20edd45571c1d024612b70d0af3e0842c5b0dc253cd",
-                    ),
+                    to: ACTION_ADDRESS,
+                    selector: SPAWN_SELECTOR,
                     calldata: vec![],
+                }];
+
+                // Move both account and calls into the async block
+                let task = runtime.runtime.spawn(async move {
+                    // Create the transaction inside the async block where we own the account
+                    let tx = account.execute_v3(calls);
+                    tx.send().await
+                });
+
+                sn.pending_txs.push_back(task);
+            }
+        }
+
+        // Handles the arrows to send a transaction to move the cube.
+        if vec![
+            KeyCode::ArrowLeft,
+            KeyCode::ArrowRight,
+            KeyCode::ArrowUp,
+            KeyCode::ArrowDown,
+        ]
+        .contains(&key_code)
+            && event.state == ButtonState::Pressed
+        {
+            let direction = match key_code {
+                KeyCode::ArrowLeft => 0,
+                KeyCode::ArrowRight => 1,
+                KeyCode::ArrowUp => 2,
+                KeyCode::ArrowDown => 3,
+                _ => panic!("Invalid key code"),
+            };
+
+            if let Some(account) = sn.account.clone() {
+                let calls = vec![Call {
+                    to: ACTION_ADDRESS,
+                    selector: MOVE_SELECTOR,
+                    calldata: vec![Felt::from(direction)],
                 }];
 
                 // Move both account and calls into the async block
@@ -216,10 +334,7 @@ async fn connect_to_starknet() -> Arc<SingleOwnerAccount<AnyProvider, LocalWalle
     ))
 }
 
-fn handle_torii_subscription(
-    runtime: Res<TokioRuntime>,
-    mut torii: ResMut<ToriiConnection>,
-) {
+fn handle_torii_subscription(runtime: Res<TokioRuntime>, mut torii: ResMut<ToriiConnection>) {
     if let Some(task) = &mut torii.subscription_task {
         // Check if the subscription task is still running
         if runtime.runtime.block_on(async { task.is_finished() }) {
@@ -230,5 +345,60 @@ fn handle_torii_subscription(
             // We'll need to reinitialize it if we want to use it again
             torii.torii = None;
         }
+    }
+}
+
+#[derive(Component)]
+struct Cube;
+
+fn setup(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(0.5, 0.5, 0.5))),
+        MeshMaterial3d(materials.add(Color::srgb(0.8, 0.2, 0.2))),
+        Cube,
+    ));
+
+    commands.spawn((
+        DirectionalLight::default(),
+        Transform::from_xyz(0.0, 0.0, 30.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(0.0, 0.0, 30.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+}
+
+/// Updates the cube position by reacting to event notifying
+/// a position change from Torii.
+///
+/// We would want to use systems ordering to ensure this system is run after the keyboard move system,
+/// this will make sure we avoid the 1-frame overhead if the event is missed.
+fn update_cube_position(
+    mut ev_position_updated: EventReader<PositionUpdatedEvent>,
+    mut query: Query<&mut Transform, With<Cube>>,
+) {
+    for ev in ev_position_updated.read() {
+        let Position { x, y, .. } = ev.0;
+        for mut transform in &mut query {
+            transform.translation = Vec3::new(x as f32, y as f32, 0.0);
+        }
+    }
+}
+
+/// Processes the position updates from the channel.
+///
+/// Technically, other systems could just use the channel resource directly.
+/// However, for decoupling and better observability, we use an event writer,
+/// which keeps Bevy's principles in mind.
+fn process_position_updates(
+    mut position_channel: ResMut<PositionUpdateChannel>,
+    mut ev_position_updated: EventWriter<PositionUpdatedEvent>,
+) {
+    while let Ok(position) = position_channel.receiver.try_recv() {
+        ev_position_updated.write(PositionUpdatedEvent(position));
     }
 }
