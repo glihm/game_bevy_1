@@ -27,6 +27,14 @@ use torii_grpc_client::types::{
 
 use url::Url;
 
+mod dojo;
+mod position;
+mod setup;
+
+use crate::dojo::{Dojo, StarknetConnection, TokioRuntime, ToriiConnection};
+use crate::position::{Position, PositionUpdateChannel, PositionUpdatedEvent};
+use crate::setup::Cube;
+
 const WORLD_ADDRESS: Felt =
     Felt::from_hex_unchecked("0x04d9778a74d2c9e6e7e4a24cbe913998a80de217c66ee173a604d06dea5469c3");
 
@@ -36,94 +44,16 @@ const ACTION_ADDRESS: Felt =
 const SPAWN_SELECTOR: Felt = selector!("spawn");
 const MOVE_SELECTOR: Felt = selector!("move");
 
-#[derive(Component, Debug)]
-pub struct Position {
-    pub player: Felt,
-    pub x: u32,
-    pub y: u32,
-}
-
-impl From<Struct> for Position {
-    fn from(struct_value: Struct) -> Self {
-        let player = struct_value
-            .get("player")
-            .unwrap()
-            .as_primitive()
-            .unwrap()
-            .as_contract_address()
-            .unwrap();
-        let x = struct_value
-            .get("x")
-            .unwrap()
-            .as_primitive()
-            .unwrap()
-            .as_u32()
-            .unwrap();
-        let y = struct_value
-            .get("y")
-            .unwrap()
-            .as_primitive()
-            .unwrap()
-            .as_u32()
-            .unwrap();
-
-        Position { player, x, y }
-    }
-}
-
-#[derive(Event)]
-struct PositionUpdatedEvent(Position);
-
-// Resource to store the Tokio runtime.
-// This is a required resource since reqwest (used by starknet-rs) requires a runtime.
-#[derive(Resource)]
-struct TokioRuntime {
-    runtime: Runtime,
-}
-
-impl Default for TokioRuntime {
-    fn default() -> Self {
-        Self {
-            runtime: Runtime::new().expect("Failed to create Tokio runtime"),
-        }
-    }
-}
-
-// Resource to store our Starknet connection state
-#[derive(Resource, Default)]
-struct StarknetConnection {
-    connecting_task: Option<JoinHandle<Arc<SingleOwnerAccount<AnyProvider, LocalWallet>>>>,
-    account: Option<Arc<SingleOwnerAccount<AnyProvider, LocalWallet>>>,
-    pending_txs: VecDeque<
-        JoinHandle<Result<InvokeTransactionResult, AccountError<SignError<LocalWalletSignError>>>>,
-    >,
-}
-
-#[derive(Resource, Default)]
-struct ToriiConnection {
-    init_task: Option<JoinHandle<Result<WorldClient, torii_grpc_client::Error>>>,
-    torii: Option<WorldClient>,
-    subscription_task: Option<JoinHandle<()>>,
-    is_subscribed: bool,
-}
-
-#[derive(Resource)]
-struct PositionUpdateChannel {
-    pub sender: Sender<Position>,
-    pub receiver: Receiver<Position>,
-}
-
 fn main() {
     let (sender, receiver) = channel(1);
 
     App::new()
         .add_plugins(DefaultPlugins)
+        .init_resource::<Dojo>()
         .init_resource::<TokioRuntime>()
-        .init_resource::<StarknetConnection>()
-        .init_resource::<ToriiConnection>()
         .insert_resource(PositionUpdateChannel { sender, receiver })
         .add_event::<PositionUpdatedEvent>()
-        .add_systems(Startup, setup)
+        .add_systems(Startup, setup::setup)
         .add_systems(
             Update,
             (
@@ -132,35 +62,33 @@ fn main() {
                 check_torii_task,
                 handle_torii_subscription,
                 process_position_updates,
-
                 // Ensure the cube position is updated after the position updates are processed.
                 // This avoids the 1-frame overhead if the event is missed in the `update_cube_position` system.
                 update_cube_position.after(process_position_updates),
-            )
+            ),
         )
         .run();
 }
 
 fn handle_keyboard_input(
-    runtime: Res<TokioRuntime>,
-    mut sn: ResMut<StarknetConnection>,
-    mut torii: ResMut<ToriiConnection>,
+    tokio: Res<TokioRuntime>,
+    mut dojo: ResMut<Dojo>,
     mut keyboard_input_events: EventReader<KeyboardInput>,
     position_channel: Res<PositionUpdateChannel>,
 ) {
     for event in keyboard_input_events.read() {
         let key_code = event.key_code;
 
-        if key_code == KeyCode::KeyI && torii.init_task.is_none() {
-            let task = runtime.runtime.spawn(async move {
+        if key_code == KeyCode::KeyI && dojo.torii.init_task.is_none() {
+            let task = tokio.runtime.spawn(async move {
                 WorldClient::new("http://localhost:8080".to_string(), WORLD_ADDRESS).await
             });
-            torii.init_task = Some(task);
-        } else if key_code == KeyCode::KeyS && !torii.is_subscribed {
+            dojo.torii.init_task = Some(task);
+        } else if key_code == KeyCode::KeyS && !dojo.torii.is_subscribed {
             dbg!("SETUP SUBSCRIPTION...");
-            if let Some(mut client) = torii.torii.take() {
+            if let Some(mut client) = dojo.torii.client.take() {
                 let sender = position_channel.sender.clone();
-                let task = runtime.runtime.spawn(async move {
+                let task = tokio.runtime.spawn(async move {
                     let mut subscription = client
                         .subscribe_entities(None)
                         .await
@@ -186,19 +114,15 @@ fn handle_keyboard_input(
                         }
                     }
                 });
-                torii.subscription_task = Some(task);
-                torii.is_subscribed = true;
-                dbg!("IS SUBSCRIBED: {}", torii.is_subscribed);
+                dojo.torii.subscription_task = Some(task);
+                dojo.torii.is_subscribed = true;
             }
-        } else if key_code == KeyCode::KeyC && sn.connecting_task.is_none() {
+        } else if key_code == KeyCode::KeyC && dojo.sn.connecting_task.is_none() {
             info!("Starting connection...");
-            let task = runtime
-                .runtime
-                .spawn(async move { connect_to_starknet().await });
-            sn.connecting_task = Some(task);
+            let task = tokio.runtime.spawn(async move { connect_to_starknet().await });
+            dojo.sn.connecting_task = Some(task);
         } else if key_code == KeyCode::KeyT && event.state == ButtonState::Pressed {
-            println!("event: {:?}", event);
-            if let Some(account) = sn.account.clone() {
+            if let Some(account) = dojo.sn.account.clone() {
                 let calls = vec![Call {
                     to: ACTION_ADDRESS,
                     selector: SPAWN_SELECTOR,
@@ -206,13 +130,13 @@ fn handle_keyboard_input(
                 }];
 
                 // Move both account and calls into the async block
-                let task = runtime.runtime.spawn(async move {
+                let task = tokio.runtime.spawn(async move {
                     // Create the transaction inside the async block where we own the account
                     let tx = account.execute_v3(calls);
                     tx.send().await
                 });
 
-                sn.pending_txs.push_back(task);
+                dojo.sn.pending_txs.push_back(task);
             }
         }
 
@@ -234,7 +158,7 @@ fn handle_keyboard_input(
                 _ => panic!("Invalid key code"),
             };
 
-            if let Some(account) = sn.account.clone() {
+            if let Some(account) = dojo.sn.account.clone() {
                 let calls = vec![Call {
                     to: ACTION_ADDRESS,
                     selector: MOVE_SELECTOR,
@@ -242,28 +166,29 @@ fn handle_keyboard_input(
                 }];
 
                 // Move both account and calls into the async block
-                let task = runtime.runtime.spawn(async move {
+                let task = tokio.runtime.spawn(async move {
                     // Create the transaction inside the async block where we own the account
                     let tx = account.execute_v3(calls);
                     tx.send().await
                 });
 
-                sn.pending_txs.push_back(task);
+                dojo.sn.pending_txs.push_back(task);
             }
         }
     }
 }
 
-fn check_torii_task(runtime: Res<TokioRuntime>, mut torii: ResMut<ToriiConnection>) {
-    if let Some(task) = &mut torii.init_task {
-        if let Ok(Ok(client)) = runtime.runtime.block_on(async { task.await }) {
+fn check_torii_task(tokio: Res<TokioRuntime>, mut dojo: ResMut<Dojo>) {
+    if let Some(task) = &mut dojo.torii.init_task {
+        if let Ok(Ok(client)) = tokio.runtime.block_on(async { task.await }) {
             info!("Torii client initialized!");
-            torii.torii = Some(client);
-            torii.init_task = None;
+            dojo.torii.client = Some(client);
+            dojo.torii.init_task = None;
 
-            runtime.runtime.block_on(async move {
-                let response = torii
+            tokio.runtime.block_on(async move {
+                let response = dojo
                     .torii
+                    .client
                     .as_mut()
                     .unwrap()
                     .retrieve_entities(ToriiQuery {
@@ -287,20 +212,20 @@ fn check_torii_task(runtime: Res<TokioRuntime>, mut torii: ResMut<ToriiConnectio
     }
 }
 
-fn check_sn_task(runtime: Res<TokioRuntime>, mut sn: ResMut<StarknetConnection>) {
+fn check_sn_task(tokio: Res<TokioRuntime>, mut dojo: ResMut<Dojo>) {
     // Check connection task
-    if let Some(task) = &mut sn.connecting_task {
-        if let Ok(account) = runtime.runtime.block_on(async { task.await }) {
+    if let Some(task) = &mut dojo.sn.connecting_task {
+        if let Ok(account) = tokio.runtime.block_on(async { task.await }) {
             info!("Connected to Starknet!");
-            sn.account = Some(account);
-            sn.connecting_task = None;
+            dojo.sn.account = Some(account);
+            dojo.sn.connecting_task = None;
         }
     }
 
     // Check pending transactions
-    if !sn.pending_txs.is_empty() && sn.account.is_some() {
-        if let Some(task) = sn.pending_txs.pop_front() {
-            if let Ok(Ok(result)) = runtime.runtime.block_on(async { task.await }) {
+    if !dojo.sn.pending_txs.is_empty() && dojo.sn.account.is_some() {
+        if let Some(task) = dojo.sn.pending_txs.pop_front() {
+            if let Ok(Ok(result)) = tokio.runtime.block_on(async { task.await }) {
                 info!("Transaction completed: {:#x}", result.transaction_hash);
             }
         }
@@ -334,42 +259,18 @@ async fn connect_to_starknet() -> Arc<SingleOwnerAccount<AnyProvider, LocalWalle
     ))
 }
 
-fn handle_torii_subscription(runtime: Res<TokioRuntime>, mut torii: ResMut<ToriiConnection>) {
-    if let Some(task) = &mut torii.subscription_task {
+fn handle_torii_subscription(tokio: Res<TokioRuntime>, mut dojo: ResMut<Dojo>) {
+    if let Some(task) = &mut dojo.torii.subscription_task {
         // Check if the subscription task is still running
-        if runtime.runtime.block_on(async { task.is_finished() }) {
+        if tokio.runtime.block_on(async { task.is_finished() }) {
             info!("Torii subscription ended");
-            torii.subscription_task = None;
-            torii.is_subscribed = false;
+            dojo.torii.subscription_task = None;
+            dojo.torii.is_subscribed = false;
             // Note: The client is consumed by the subscription task
             // We'll need to reinitialize it if we want to use it again
-            torii.torii = None;
+            dojo.torii.client = None;
         }
     }
-}
-
-#[derive(Component)]
-struct Cube;
-
-fn setup(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(0.5, 0.5, 0.5))),
-        MeshMaterial3d(materials.add(Color::srgb(0.8, 0.2, 0.2))),
-        Cube,
-    ));
-
-    commands.spawn((
-        DirectionalLight::default(),
-        Transform::from_xyz(0.0, 0.0, 30.0).looking_at(Vec3::ZERO, Vec3::Y),
-    ));
-    commands.spawn((
-        Camera3d::default(),
-        Transform::from_xyz(0.0, 0.0, 30.0).looking_at(Vec3::ZERO, Vec3::Y),
-    ));
 }
 
 /// Updates the cube position by reacting to event notifying
